@@ -1,0 +1,116 @@
+name: Build Python SDK wheel
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip build
+          python -m pip install -e "./python[dev]"
+
+      - name: Run tests
+        run: python -m pytest -q python/tests
+
+      - name: Validate tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          setup_py = pathlib.Path("python/setup.py").read_text(encoding="utf-8")
+          match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', setup_py)
+          if not match:
+              sys.exit("Could not find version in python/setup.py")
+
+          package_version = match.group(1)
+          tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          if package_version != tag_version:
+              sys.exit(
+                  f"Tag version {tag_version} does not match package version {package_version}"
+              )
+          PY
+
+      - name: Build wheel
+        run: |
+          cd python
+          python -m build --wheel
+
+      - name: Inspect wheel
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheels = list(Path("python/dist").glob("*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"Expected one wheel, found {len(wheels)}")
+
+          with ZipFile(wheels[0]) as wheel:
+              names = wheel.namelist()
+          if any(name.startswith("tests/") for name in names):
+              raise SystemExit("Wheel unexpectedly contains tests/")
+
+          print(wheels[0])
+          PY
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdk-wheel
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+  release:
+    needs: build-wheel
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: python-sdk-wheel
+          path: dist
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.whl \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.whl \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Python SDK wheel release $GITHUB_REF_NAME"
+          fi
